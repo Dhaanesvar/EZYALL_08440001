@@ -2,7 +2,7 @@
 
 /**
  * RAK3112 — ESP32-S3 + SX1262 (SPI) — LoRaWAN config portal + live log
- * Modified to forward downlink payloads to Pico over Serial0 (UART0, pins J6-8)
+ * Modified to forward downlink payloads to Pico over UART1 (safe S3 pins)
  */
 
 #include <Arduino.h>
@@ -31,6 +31,17 @@
 #define LED_RED     35
 #define LED_GREEN   34
 
+// UART bridge to Pico (user wiring).
+static const int PICO_UART_TX_PIN = 32;
+static const int PICO_UART_RX_PIN = 33;
+HardwareSerial& picoUart = Serial2;
+static const bool PICO_UART_BRIDGE_ENABLED = false;
+
+inline void picoUartWriteLine(const char* s) {
+  if (!PICO_UART_BRIDGE_ENABLED) return;
+  picoUart.println(s);
+}
+
 // --- RadioLib ---
 #include <RadioLib.h>
 Module   sx1262Module(LORA_SX126X_CS, LORA_SX126X_DIO1, LORA_SX126X_RESET, LORA_SX126X_BUSY, SPI);
@@ -38,12 +49,6 @@ SX1262   radio(&sx1262Module);
 LoRaWANNode* lorawan = nullptr;
 static const LoRaWANBand_t* lwBand = &EU868;
 static uint8_t lwSubBand = 0;
-
-// Dedicated UART link to Pico (TX=GPIO32, RX=GPIO33).
-HardwareSerial picoUart(1);
-static const int PICO_UART_TX_PIN = 32;
-static const int PICO_UART_RX_PIN = 33;
-static const bool ENABLE_PICO_UART = false;
 
 // --- Session keys (filled from config) ---
 uint8_t binJoinEUI[8];
@@ -55,11 +60,15 @@ uint8_t binAppSKey[16];
 uint32_t binDevAddr = 0;
 
 // ─── WiFi AP ─────────────────────────────────────────────────────────────────
-static const char* AP_SSID     = "CRE8IOT_08440001";
+static const char* AP_SSID_DEFAULT = "CRE8IOT_08440001";
 static const char* AP_PASSWORD = "";   // min 8 chars
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_GW(192, 168, 4, 1);
+static const IPAddress AP_IP_DEFAULT(192, 168, 4, 1);
+static const IPAddress AP_GW_DEFAULT(192, 168, 4, 1);
 static const IPAddress AP_SN(255, 255, 255, 0);
+static const char* BOARD_IP_DEFAULT_INFO = "13.22.0.213";
+static char g_apSsid[33] = {0};
+static IPAddress g_apIp = AP_IP_DEFAULT;
+static IPAddress g_apGw = AP_GW_DEFAULT;
 
 // ─── Runtime flags ───────────────────────────────────────────────────────────
 bool     g_radioPhyReady = false;
@@ -95,6 +104,11 @@ struct DeviceConfig {
   uint8_t intervalHour;    // Health ping interval (hours)
   uint8_t intervalDay;     // Health ping interval (days)
   uint8_t intervalMonth;   // Health ping interval (months)
+  char uidName[32];        // AP/UID display name editable from portal
+  char apIp[16];           // editable AP IP address
+  char ledUid[16];         // editable LED board UID shown to YAT/API
+  char ledMac[24];         // editable LED board MAC shown to YAT/API
+  char ledIp[16];          // editable LED board IP shown to YAT/API
   char customPayload[128]; // Custom uplink payload (ASCII)
 } cfg;
 
@@ -151,7 +165,19 @@ unsigned long lastGreenBlink = 0;
 bool greenLedOn = false;
 bool redBlinkForever = false;    // ADDED: infinite red blink on error
 
-// Forward declarations for functions used before their definitions.
+void syncApIpFromConfig() {
+  IPAddress parsed;
+  if (parsed.fromString(cfg.apIp)) {
+    g_apIp = parsed;
+    g_apGw = parsed;
+  } else {
+    g_apIp = AP_IP_DEFAULT;
+    g_apGw = AP_GW_DEFAULT;
+    strlcpy(cfg.apIp, "192.168.4.1", sizeof(cfg.apIp));
+  }
+}
+
+// Forward declarations for functions referenced before definition.
 int initRadioPhy();
 bool createLoRaWAN();
 bool doJoin();
@@ -170,12 +196,13 @@ void addDownlink(const char* t, const char* hex, const char* ascii, int len, uin
   if (downlinkCount < MAX_DOWNLINK) downlinkCount++;
   
   // UART Output
-    if (len > 0) {
+  if (len > 0) {
     Serial.println(ascii);           // existing
-    if (ENABLE_PICO_UART) picoUart.println(ascii);  // send to Pico
-    // --- ADD THIS LINE ---
-    Serial.print("[PICO] Sent via UART1: ");
-    Serial.println(ascii);
+    picoUartWriteLine(ascii);
+    if (PICO_UART_BRIDGE_ENABLED) {
+      Serial.print("[PICO] Sent via UART1: ");
+      Serial.println(ascii);
+    }
   }
 }
 
@@ -189,7 +216,10 @@ void addLog(const char* dir, const String& m) {
   e.msg[sizeof(e.msg) - 1] = 0;
   logHead = (logHead + 1) % MAX_LOG;
   if (logCount < MAX_LOG) logCount++;
-  if (Serial) Serial.printf("[%s][%s] %s\n", e.t, e.dir, e.msg);
+  // Web live log keeps everything; serial/YAT hides only UP entries.
+  if (Serial && strcmp(e.dir, "UP") != 0) {
+    Serial.printf("[%s][%s] %s\n", e.t, e.dir, e.msg);
+  }
 }
 
 // ─── Helpers: hex ───────────────────────────────────────────────────────────
@@ -290,77 +320,45 @@ void resetRadio() {
 
 
 // ─── NVS ────────────────────────────────────────────────────────────────────
-void loadConfigDefaults() {
-  strlcpy(cfg.mode, "OTAA", sizeof(cfg.mode));
-  strlcpy(cfg.region, "EU868", sizeof(cfg.region));
-  cfg.frequencyHz = defaultHzForRegion(cfg.region);
-  cfg.subBand = 0;
-  cfg.adr = true;
-  cfg.confirmed = false;
-  cfg.fPort = 1;
-  cfg.txPower = 14;
-  cfg.serialBaud = 115200;
-  cfg.joinEUI[0] = 0;
-  cfg.devEUI[0] = 0;
-  cfg.appKey[0] = 0;
-  cfg.nwkKey[0] = 0;
-  cfg.devAddr[0] = 0;
-  cfg.nwkSKey[0] = 0;
-  cfg.appSKey[0] = 0;
-  strlcpy(cfg.lwClass, "C", sizeof(cfg.lwClass));
-  cfg.intervalSec = 0;
-  cfg.intervalMin = 0;
-  cfg.intervalHour = 0;
-  cfg.intervalDay = 0;
-  cfg.intervalMonth = 0;
-  cfg.customPayload[0] = 0;
-}
-
 void loadConfig() {
-  loadConfigDefaults();
+  prefs.begin(PREFS_NS, true);
+  strlcpy(cfg.mode, prefs.getString("mode", "OTAA").c_str(), sizeof(cfg.mode));
+  strlcpy(cfg.region, prefs.getString("region", "EU868").c_str(), sizeof(cfg.region));
+  cfg.frequencyHz = prefs.getUInt("freqHz", defaultHzForRegion(cfg.region));
+  cfg.subBand     = prefs.getUChar("subBand", 0);
+  cfg.adr         = prefs.getBool("adr", true);
+  cfg.confirmed   = prefs.getBool("confirmed", false);
+  cfg.fPort       = prefs.getUChar("fPort", 1);
+  cfg.txPower     = (int8_t)prefs.getChar("txPower", 14);
+  cfg.serialBaud  = prefs.getUInt("baud", 115200);
 
-  if (!prefs.begin(PREFS_NS, false)) {
-    return;
-  }
-
-  if (prefs.isKey("mode")) {
-    strlcpy(cfg.mode, prefs.getString("mode", cfg.mode).c_str(), sizeof(cfg.mode));
-  }
-  if (prefs.isKey("region")) {
-    strlcpy(cfg.region, prefs.getString("region", cfg.region).c_str(), sizeof(cfg.region));
-  }
-  if (prefs.isKey("freqHz")) cfg.frequencyHz = prefs.getUInt("freqHz", cfg.frequencyHz);
-  if (prefs.isKey("subBand")) cfg.subBand = prefs.getUChar("subBand", cfg.subBand);
-  if (prefs.isKey("adr")) cfg.adr = prefs.getBool("adr", cfg.adr);
-  if (prefs.isKey("confirmed")) cfg.confirmed = prefs.getBool("confirmed", cfg.confirmed);
-  if (prefs.isKey("fPort")) cfg.fPort = prefs.getUChar("fPort", cfg.fPort);
-  if (prefs.isKey("txPower")) cfg.txPower = (int8_t)prefs.getChar("txPower", cfg.txPower);
-  if (prefs.isKey("baud")) cfg.serialBaud = prefs.getUInt("baud", cfg.serialBaud);
-
-  if (prefs.isKey("joinEUI")) strlcpy(cfg.joinEUI, prefs.getString("joinEUI", cfg.joinEUI).c_str(), sizeof(cfg.joinEUI));
-  if (prefs.isKey("devEUI")) strlcpy(cfg.devEUI, prefs.getString("devEUI", cfg.devEUI).c_str(), sizeof(cfg.devEUI));
-  if (prefs.isKey("appKey")) strlcpy(cfg.appKey, prefs.getString("appKey", cfg.appKey).c_str(), sizeof(cfg.appKey));
-  if (prefs.isKey("nwkKey")) strlcpy(cfg.nwkKey, prefs.getString("nwkKey", cfg.nwkKey).c_str(), sizeof(cfg.nwkKey));
-  if (prefs.isKey("devAddr")) strlcpy(cfg.devAddr, prefs.getString("devAddr", cfg.devAddr).c_str(), sizeof(cfg.devAddr));
-  if (prefs.isKey("nwkSKey")) strlcpy(cfg.nwkSKey, prefs.getString("nwkSKey", cfg.nwkSKey).c_str(), sizeof(cfg.nwkSKey));
-  if (prefs.isKey("appSKey")) strlcpy(cfg.appSKey, prefs.getString("appSKey", cfg.appSKey).c_str(), sizeof(cfg.appSKey));
+  strlcpy(cfg.joinEUI, prefs.getString("joinEUI", "").c_str(), sizeof(cfg.joinEUI));
+  strlcpy(cfg.devEUI, prefs.getString("devEUI", "").c_str(), sizeof(cfg.devEUI));
+  strlcpy(cfg.appKey, prefs.getString("appKey", "").c_str(), sizeof(cfg.appKey));
+  strlcpy(cfg.nwkKey, prefs.getString("nwkKey", "").c_str(), sizeof(cfg.nwkKey));
+  strlcpy(cfg.devAddr, prefs.getString("devAddr", "").c_str(), sizeof(cfg.devAddr));
+  strlcpy(cfg.nwkSKey, prefs.getString("nwkSKey", "").c_str(), sizeof(cfg.nwkSKey));
+  strlcpy(cfg.appSKey, prefs.getString("appSKey", "").c_str(), sizeof(cfg.appSKey));
   // Force Class C
   strlcpy(cfg.lwClass, "C", sizeof(cfg.lwClass));
-  if (prefs.isKey("intervalSec")) cfg.intervalSec = prefs.getUChar("intervalSec", cfg.intervalSec);
-  if (prefs.isKey("intervalMin")) cfg.intervalMin = prefs.getUChar("intervalMin", cfg.intervalMin);
-  if (prefs.isKey("intervalHour")) cfg.intervalHour = prefs.getUChar("intervalHour", cfg.intervalHour);
-  if (prefs.isKey("intervalDay")) cfg.intervalDay = prefs.getUChar("intervalDay", cfg.intervalDay);
-  if (prefs.isKey("intervalMonth")) cfg.intervalMonth = prefs.getUChar("intervalMonth", cfg.intervalMonth);
-  if (prefs.isKey("customPayload")) strlcpy(cfg.customPayload, prefs.getString("customPayload", cfg.customPayload).c_str(), sizeof(cfg.customPayload));
+  cfg.intervalSec = prefs.getUChar("intervalSec", 2);
+  cfg.intervalMin = prefs.getUChar("intervalMin", 0);
+  cfg.intervalHour = prefs.getUChar("intervalHour", 0);
+  cfg.intervalDay = prefs.getUChar("intervalDay", 0);
+  cfg.intervalMonth = prefs.getUChar("intervalMonth", 0);
+  strlcpy(cfg.uidName, prefs.getString("uidName", AP_SSID_DEFAULT).c_str(), sizeof(cfg.uidName));
+  strlcpy(cfg.apIp, prefs.getString("apIp", "192.168.4.1").c_str(), sizeof(cfg.apIp));
+  strlcpy(cfg.ledUid, prefs.getString("ledUid", "08-44").c_str(), sizeof(cfg.ledUid));
+  strlcpy(cfg.ledMac, prefs.getString("ledMac", "DE:AD:BE:EF:FE:ED").c_str(), sizeof(cfg.ledMac));
+  strlcpy(cfg.ledIp, prefs.getString("ledIp", BOARD_IP_DEFAULT_INFO).c_str(), sizeof(cfg.ledIp));
+  strlcpy(cfg.customPayload, prefs.getString("customPayload", "").c_str(), sizeof(cfg.customPayload));
   prefs.end();
   strlcpy(cfg.lwClass, "C", sizeof(cfg.lwClass));  // HARD LOCK CLASS C
+  syncApIpFromConfig();
 }
 
 void saveConfig() {
-  if (!prefs.begin(PREFS_NS, false)) {
-    addLog("ERROR", "Cannot open NVS for save");
-    return;
-  }
+  prefs.begin(PREFS_NS, false);
   prefs.putString("mode", cfg.mode);
   prefs.putString("region", cfg.region);
   prefs.putUInt("freqHz", cfg.frequencyHz);
@@ -384,6 +382,11 @@ void saveConfig() {
   prefs.putUChar("intervalHour", cfg.intervalHour);
   prefs.putUChar("intervalDay", cfg.intervalDay);
   prefs.putUChar("intervalMonth", cfg.intervalMonth);
+  prefs.putString("uidName", cfg.uidName);
+  prefs.putString("apIp", cfg.apIp);
+  prefs.putString("ledUid", cfg.ledUid);
+  prefs.putString("ledMac", cfg.ledMac);
+  prefs.putString("ledIp", cfg.ledIp);
   prefs.end();
   addLog("INFO", "Configuration saved to NVS (Preferences).");
 }
@@ -559,12 +562,14 @@ bool doJoin() {
     }
 
     st = lorawan->activateOTAA();
+
     if (st != RADIOLIB_LORAWAN_NEW_SESSION && st != RADIOLIB_LORAWAN_SESSION_RESTORED) {
       addLog("ERROR", String("activateOTAA failed: ") + lwErrStr(st));
       addLog("ERROR", "Check TTN keys, region, sub-band, gateway coverage, and 'Resets join nonces' if testing.");
       redBlinkForever = true;
       return false;
     }
+
     addLog("UP", st == RADIOLIB_LORAWAN_NEW_SESSION
                 ? "OTAA NEW SESSION — Join-Accept received (device ↔ gateway ↔ TTN join path OK)."
                 : "OTAA SESSION RESTORED from NVS (no new Join-Accept this boot).");
@@ -633,87 +638,210 @@ uint32_t getUplinkIntervalMs() {
   ms += (uint32_t)cfg.intervalHour * 60UL * 60UL * 1000UL;
   ms += (uint32_t)cfg.intervalDay * 24UL * 60UL * 60UL * 1000UL;
   ms += (uint32_t)cfg.intervalMonth * 30UL * 24UL * 60UL * 60UL * 1000UL;
-  if (ms == 0) ms = 60000UL;
+  if (ms == 0) ms = 2000UL;
   return ms;
 }
 
 // ─── HTTP: embedded UI (unchanged, same as original) ─────────────────────────
 static const char PAGE[] = R"HTML(
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>RAK3112 LoRaWAN</title>
 <style>
+:root{
+  --bg:#F3F5F8;
+  --surface:#FFFFFF;
+  --surface-alt:#F8FAFC;
+  --border:#DEE3EC;
+  --text:#131722;
+  --muted:#62697B;
+  --accent:#2B6CEE;
+  --accent-ink:#FFFFFF;
+  --accent-2:#0EA5A0;
+  --warn:#B0650A;
+  --warn-bg:#FCEFD9;
+  --danger:#C6392F;
+  --danger-bg:#FBE4E1;
+  --success:#188752;
+  --success-bg:#DEF3E7;
+  --shadow:0 1px 2px rgba(20,25,40,.04), 0 8px 24px -12px rgba(20,25,40,.10);
+  --radius:12px;
+  --mono:'Times New Roman',Times,serif;
+  --sans:'Times New Roman',Times,serif;
+  color-scheme:light;
+}
+:root[data-theme="dark"]{
+  --bg:#090C11;
+  --surface:#11151D;
+  --surface-alt:#161B25;
+  --border:#232A38;
+  --text:#E8ECF5;
+  --muted:#8992A6;
+  --accent:#5B9BFF;
+  --accent-ink:#06101F;
+  --accent-2:#2DD9CE;
+  --warn:#F5A524;
+  --warn-bg:#2E2410;
+  --danger:#FF6259;
+  --danger-bg:#301315;
+  --success:#34D399;
+  --success-bg:#0F2A22;
+  --shadow:0 1px 2px rgba(0,0,0,.3), 0 10px 30px -14px rgba(0,0,0,.6);
+  color-scheme:dark;
+}
 *{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:system-ui,-apple-system,sans-serif;background:#f5f7fa;color:#1a1d23;font-size:14px;padding-bottom:20px;}
+html{-webkit-tap-highlight-color:transparent;}
+body{
+  font-family:var(--sans);
+  background:
+    radial-gradient(1200px 480px at 50% -180px, color-mix(in srgb, var(--accent) 7%, transparent), transparent 60%),
+    var(--bg);
+  color:var(--text);
+  font-size:14px;
+  min-height:100vh;
+  padding-bottom:28px;
+  transition:background-color .25s ease,color .25s ease;
+}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.001ms !important;transition-duration:.001ms !important;}}
 
 /* ── Login ── */
 #loginPage{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
-.login-card{background:#fff;border:1px solid #e0e4ec;border-radius:14px;padding:30px 20px;width:100%;max-width:340px;box-shadow:0 2px 16px rgba(0,0,0,.07);}
-.login-card h2{font-size:20px;font-weight:600;color:#1a1d23;margin-bottom:6px;}
-.login-card p{font-size:13px;color:#6b7280;margin-bottom:24px;}
-.login-card input{width:100%;padding:12px;border:1px solid #d1d5db;border-radius:8px;font-size:16px;color:#1a1d23;background:#fff;outline:none;}
-.login-card input:focus{border-color:#4f6ef7;}
-.login-card .err{color:#dc2626;font-size:12px;margin-top:6px;min-height:16px;}
-.login-card button{width:100%;margin-top:18px;padding:12px;background:#4f6ef7;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer;}
+.login-card{position:relative;overflow:hidden;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px 24px;width:100%;max-width:340px;box-shadow:var(--shadow);}
+.login-mark{width:44px;height:44px;border-radius:11px;background:linear-gradient(155deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;margin-bottom:18px;}
+.login-mark svg{width:24px;height:24px;stroke:var(--accent-ink);}
+.login-card h2{font-size:19px;font-weight:700;color:var(--text);margin-bottom:4px;letter-spacing:-.01em;}
+.login-card p{font-size:13px;color:var(--muted);margin-bottom:22px;}
+.login-card input{width:100%;padding:13px 14px;border:1px solid var(--border);border-radius:9px;font-size:16px;color:var(--text);background:var(--surface-alt);outline:none;font-family:var(--mono);letter-spacing:.04em;transition:border-color .15s;}
+.login-card input:focus{border-color:var(--accent);}
+.login-card .err{color:var(--danger);font-size:12px;margin-top:8px;min-height:16px;font-weight:500;}
+.login-card button{width:100%;margin-top:16px;padding:13px;background:var(--accent);color:var(--accent-ink);border:none;border-radius:9px;font-size:15px;font-weight:700;cursor:pointer;transition:filter .15s,transform .08s;}
+.login-card button:hover{filter:brightness(1.08);}
+.login-card button:active{transform:scale(.98);}
+.login-foot{margin-top:18px;font-size:11px;color:var(--muted);text-align:center;font-family:var(--mono);}
 
 /* ── Layout ── */
-header{background:#fff;border-bottom:1px solid #e0e4ec;padding:12px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;}
-header h1{font-size:14px;font-weight:600;color:#1a1d23;}
-.status-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:500;}
-.pill-ok{background:#dcfce7;color:#166534;}
-.pill-err{background:#fee2e2;color:#991b1b;}
-.pill-idle{background:#f1f5f9;color:#475569;}
-.dot{width:7px;height:7px;border-radius:50%;background:currentColor;opacity:.75;}
+header{
+  position:sticky;top:0;z-index:20;
+  background:color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--border);
+  padding:12px 16px;
+  display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0;}
+.brand-mark{flex:0 0 auto;width:32px;height:32px;border-radius:9px;background:linear-gradient(155deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;}
+.brand-mark svg{width:18px;height:18px;stroke:var(--accent-ink);}
+.brand-text{min-width:0;}
+.brand-text h1{font-size:14px;font-weight:700;color:var(--text);letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.brand-text .sub{font-size:10.5px;color:var(--muted);font-family:var(--mono);letter-spacing:.03em;}
 
-.page{padding:16px;}
-.card{background:#fff;border:1px solid #e0e4ec;border-radius:12px;padding:16px;margin-bottom:16px;}
-.card h2{font-size:13px;font-weight:600;color:#6b7280;text-transform:uppercase;letter-spacing:.06em;margin-bottom:16px;}
+.header-actions{display:flex;align-items:center;gap:8px;}
+
+.status-pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;border:1px solid transparent;}
+.pill-ok{background:var(--success-bg);color:var(--success);}
+.pill-err{background:var(--danger-bg);color:var(--danger);}
+.pill-idle{background:var(--surface-alt);color:var(--muted);border-color:var(--border);}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor;position:relative;}
+.pill-ok .dot::after{content:'';position:absolute;inset:-4px;border-radius:50%;background:currentColor;opacity:.35;animation:pulse 1.8s ease-out infinite;}
+@keyframes pulse{0%{transform:scale(.6);opacity:.45;}100%{transform:scale(2.2);opacity:0;}}
+
+.theme-toggle{display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:9px;border:1px solid var(--border);background:var(--surface-alt);color:var(--text);cursor:pointer;transition:background .15s,transform .08s;}
+.theme-toggle:hover{background:var(--border);}
+.theme-toggle:active{transform:scale(.94);}
+.theme-toggle svg{width:17px;height:17px;stroke:currentColor;}
+
+.page{padding:16px;max-width:1320px;width:98%;margin:0 auto;display:grid;grid-template-columns:1fr;gap:16px;}
+@media (min-width:860px){
+  .page{grid-template-columns:1.15fr 1fr;align-items:start;}
+  .span-2{grid-column:1 / -1;}
+}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px;box-shadow:var(--shadow);}
+.card h2{font-size:11.5px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:14px;display:flex;align-items:center;gap:7px;}
+.card h2 .ic{width:14px;height:14px;stroke:var(--muted);flex:0 0 auto;}
 
 /* ── Form ── */
-.formgrid{display:flex;flex-direction:column;gap:12px;}
-label{display:block;font-size:12px;font-weight:500;color:#374151;margin-bottom:4px;}
-input,select{width:100%;padding:11px;border:1px solid #d1d5db;border-radius:7px;font-size:16px;color:#1a1d23;background:#fff;outline:none;}
-.check-row{display:flex;align-items:center;gap:8px;padding:9px 0;}
-.check-row input[type=checkbox]{width:20px;height:20px;accent-color:#4f6ef7;cursor:pointer;}
+.formgrid{display:flex;flex-direction:column;gap:13px;}
+label{display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:5px;letter-spacing:.02em;}
+input,select{width:100%;padding:11px 12px;border:1px solid var(--border);border-radius:8px;font-size:15px;color:var(--text);background:var(--surface-alt);outline:none;transition:border-color .15s,box-shadow .15s;font-family:var(--sans);}
+input[id$="EUI"],input[id$="Key"],input[id$="SKey"],input[id="devAddr"]{font-family:var(--mono);font-size:13px;letter-spacing:.02em;}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);}
+input::placeholder{color:var(--muted);opacity:.7;}
 
-.interval-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;}
-.interval-grid .lbl{font-size:11px;color:#6b7280;margin-bottom:3px;font-weight:500;}
+.check-row{display:flex;align-items:center;gap:10px;padding:8px 0;cursor:pointer;}
+.check-row input[type=checkbox]{width:19px;height:19px;accent-color:var(--accent);cursor:pointer;}
+.check-row span{font-size:13.5px;font-weight:500;color:var(--text);}
+
+.section-title{font-size:11.5px;font-weight:600;color:var(--muted);letter-spacing:.02em;margin-bottom:8px;}
+.interval-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;}
+@media (max-width:420px){.interval-grid{grid-template-columns:repeat(2,1fr);}}
+.interval-grid .lbl{font-size:10.5px;color:var(--muted);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;}
+.interval-grid input{text-align:center;padding:9px 6px;}
+
+hr.sep{border:none;border-top:1px solid var(--border);margin:2px 0;}
 
 /* ── Buttons ── */
-.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;}
-.btn{padding:11px 16px;border-radius:7px;border:none;cursor:pointer;font-size:14px;font-weight:600;flex:1;min-width:100px;}
-.btn-save{background:#4f6ef7;color:#fff;}
-.btn-join{background:#059669;color:#fff;}
-.btn-leave{background:#f1f5f9;color:#475569;border:1px solid #e0e4ec;}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;}
+.btn{padding:12px 14px;border-radius:8px;border:1px solid transparent;cursor:pointer;font-size:13.5px;font-weight:700;flex:1;min-width:96px;transition:filter .15s,transform .08s,box-shadow .15s;letter-spacing:.01em;}
+.btn-save{background:var(--accent);color:var(--accent-ink);}
+.btn-join{background:var(--success);color:#08281A;}
+.btn-leave{background:var(--surface-alt);color:var(--text);border-color:var(--border);}
+.btn-force{background:var(--warn);color:#2B1900;}
+.btn:hover{filter:brightness(1.06);}
+.btn:active{transform:scale(.97);}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
 
 /* ── Log ── */
-#log{font-family:'SF Mono',monospace;font-size:10px;background:#f8fafc;border:1px solid #e0e4ec;border-radius:8px;padding:10px;height:200px;overflow-y:auto;line-height:1.4;color:#1e293b;word-break:break-all;}
-.log-up{color:#0369a1;}
-.log-down{color:#7c3aed;}
-.log-err{color:#dc2626;}
+#log{font-family:var(--mono);font-size:11px;background:var(--surface-alt);border:1px solid var(--border);border-radius:9px;padding:11px;height:230px;overflow-y:auto;line-height:1.55;color:var(--text);word-break:break-all;}
+#log div{padding:1px 0;}
+.log-up{color:var(--accent);}
+.log-down{color:var(--accent-2);}
+.log-err{color:var(--danger);}
 
-/* ── NEW: Downlink State Monitor Box ── */
-#dlStateBox{background:#f8fafc;border:1px solid #e0e4ec;border-radius:8px;padding:12px;margin-top:12px;}
-.dl-row{padding:6px 0;border-bottom:1px solid #e0e4ec;display:flex;flex-wrap:wrap;justify-content:space-between;}
+/* ── Downlink state monitor ── */
+#dlStateBox{background:var(--surface-alt);border:1px solid var(--border);border-radius:9px;padding:4px 12px;}
+.dl-row{padding:10px 0;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:6px;justify-content:space-between;align-items:center;}
 .dl-row:last-child{border-bottom:none;}
-.dl-label{color:#6b7280;font-size:12px;font-weight:500;}
-.dl-value{color:#1a1d23;font-size:13px;font-weight:500;text-align:right;}
-.dl-highlight{color:#059669;font-weight:600;}
-.dl-warning{color:#d97706;}
+.dl-label{color:var(--muted);font-size:12px;font-weight:600;}
+.dl-value{color:var(--text);font-size:13px;font-weight:600;text-align:right;font-family:var(--mono);}
+.dl-highlight{color:var(--accent-2);font-weight:700;}
+.dl-warning{color:var(--warn);}
 
-/* ─── Downlink monitor ── */
-#downlinkBox{background:#f8fafc;border:1px solid #e0e4ec;border-radius:8px;padding:10px;min-height:70px;font-family:monospace;font-size:10px;line-height:1.4;color:#1e293b;overflow-y:auto;max-height:150px;}
-.dl-port{background:#ede9fe;color:#5b21b6;border-radius:4px;padding:2px 6px;font-size:10px;display:inline-block;margin-right:4px;}
+/* ── Downlink history ── */
+#downlinkBox{background:var(--surface-alt);border:1px solid var(--border);border-radius:9px;padding:10px;min-height:70px;font-family:var(--mono);font-size:11px;line-height:1.7;color:var(--text);overflow-y:auto;max-height:180px;}
+#downlinkBox .empty{color:var(--muted);}
+.dl-entry{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--border);}
+.dl-entry:last-child{border-bottom:none;}
+.dl-time{color:var(--muted);font-size:10.5px;}
+.dl-port{background:color-mix(in srgb, var(--accent-2) 18%, transparent);color:var(--accent-2);border-radius:5px;padding:2px 7px;font-size:10px;font-weight:700;white-space:nowrap;}
+.dl-hex{color:var(--accent);}
+.dl-ascii{color:var(--muted);}
+
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;}
+.card-head h2{margin-bottom:0;}
+.btn-clear{padding:7px 12px;border-radius:7px;border:1px solid var(--border);background:var(--surface-alt);color:var(--text);font-size:12px;font-weight:700;cursor:pointer;transition:background .15s;}
+.btn-clear:hover{background:var(--border);}
+.btn-clear.is-busy{opacity:.6;cursor:wait;}
+.mini{padding:7px 11px;border-radius:7px;border:1px solid var(--border);background:var(--surface-alt);color:var(--text);font-size:12px;font-weight:700;cursor:pointer;transition:background .15s;}
+.mini:hover{background:var(--border);}
+.meta-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:12px;}
+@media (max-width:380px){.meta-grid{grid-template-columns:1fr;}}
+.meta-item{background:var(--surface-alt);border:1px solid var(--border);border-radius:8px;padding:9px 10px;}
+.meta-item .k{font-size:10.5px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;}
+.meta-item .v{font-size:12.5px;color:var(--text);font-weight:600;word-break:break-all;font-family:var(--mono);}
 </style>
 </head><body>
 
 <!-- ═══ LOGIN ═══ -->
 <div id="loginPage">
   <div class="login-card">
+    <div class="login-mark"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20v-7"/><path d="M8.5 16.5a5 5 0 0 1 0-9"/><path d="M15.5 16.5a5 5 0 0 0 0-9"/><path d="M5.5 20a9 9 0 0 1 0-16"/><path d="M18.5 20a9 9 0 0 0 0-16"/><circle cx="12" cy="10" r="2.2"/></svg></div>
     <h2>RAK3112 Portal</h2>
-    <p>Enter portal password</p>
-    <input id="pass" type="password" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
+    <p>Enter the device password to continue</p>
+    <input id="pass" type="password" placeholder="Password" autocomplete="off" onkeydown="if(event.key==='Enter')doLogin()">
     <div class="err" id="err"></div>
     <button onclick="doLogin()">Sign in</button>
+    <div class="login-foot">192.168.4.1 · local device network</div>
   </div>
 </div>
 
@@ -721,18 +849,73 @@ input,select{width:100%;padding:11px;border:1px solid #d1d5db;border-radius:7px;
 <div id="mainPage" style="display:none">
 
 <header>
-  <h1>RAK3112 LoRaWAN</h1>
-  <span class="status-pill pill-idle" id="statusPill"><span class="dot"></span><span id="statusTxt">Idle</span></span>
+  <div class="brand">
+    <div class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20v-7"/><path d="M8.5 16.5a5 5 0 0 1 0-9"/><path d="M15.5 16.5a5 5 0 0 0 0-9"/><path d="M5.5 20a9 9 0 0 1 0-16"/><path d="M18.5 20a9 9 0 0 0 0-16"/><circle cx="12" cy="10" r="2.2"/></svg></div>
+    <div class="brand-text">
+      <h1>RAK3112 LoRaWAN</h1>
+      <div class="sub">Class&nbsp;C&nbsp;· SX1262</div>
+    </div>
+  </div>
+  <div class="header-actions">
+    <span class="status-pill pill-idle" id="statusPill"><span class="dot"></span><span id="statusTxt">Idle</span></span>
+    <button class="theme-toggle" id="themeToggle" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle dark mode">
+      <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></svg>
+    </button>
+  </div>
 </header>
 
 <div class="page">
 
+  <div class="card span-2">
+    <div class="card-head">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10M7 12h10M7 16h6"/></svg>Device info</h2>
+      <button class="mini" onclick="toggleDeviceInfo()" id="deviceInfoBtn">Show UID / MAC / IP</button>
+    </div>
+    <div id="deviceInfoPanel" style="display:none">
+      <div class="formgrid">
+        <div>
+          <label>UID name (editable — also sets the AP SSID)</label>
+          <input id="uidName" placeholder="Device UID name">
+        </div>
+        <div>
+          <label>Device IP (editable on board)</label>
+          <input id="deviceIp" placeholder="192.168.4.1">
+        </div>
+        <div>
+          <label>LED board UID (editable)</label>
+          <input id="ledUid" placeholder="08-44">
+        </div>
+        <div>
+          <label>LED board MAC (editable)</label>
+          <input id="ledMac" placeholder="DE:AD:BE:EF:FE:ED">
+        </div>
+        <div>
+          <label>LED board IP (editable)</label>
+          <input id="ledBoardIp" placeholder="13.22.0.213">
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-save" onclick="saveDeviceInfo()">Save device info</button>
+        </div>
+      </div>
+      <div class="meta-grid">
+        <div class="meta-item"><div class="k">UID</div><div class="v" id="uidVal">--</div></div>
+        <div class="meta-item"><div class="k">MAC</div><div class="v" id="macVal">--</div></div>
+        <div class="meta-item"><div class="k">IP</div><div class="v" id="ipVal">--</div></div>
+        <div class="meta-item"><div class="k">Board Default IP</div><div class="v" id="boardDefaultIpVal">--</div></div>
+        <div class="meta-item"><div class="k">LED UID</div><div class="v" id="ledUidVal">--</div></div>
+        <div class="meta-item"><div class="k">LED MAC</div><div class="v" id="ledMacVal">--</div></div>
+        <div class="meta-item"><div class="k">LED IP</div><div class="v" id="ledIpVal">--</div></div>
+        <div class="meta-item"><div class="k">AP SSID</div><div class="v" id="ssidVal">--</div></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Config -->
   <div class="card">
-    <h2>Configuration</h2>
+    <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10M18 20V4M6 20v-4"/></svg>Configuration</h2>
     <div class="formgrid">
       <div>
-        <label>Mode</label>
+        <label>Activation mode</label>
         <select id="mode">
           <option value="OTAA">OTAA</option>
           <option value="ABP">ABP</option>
@@ -760,11 +943,11 @@ input,select{width:100%;padding:11px;border:1px solid #d1d5db;border-radius:7px;
         <input id="fPort" type="number" value="1">
       </div>
       <div>
-        <label>TX Power (dBm)</label>
+        <label>TX power (dBm)</label>
         <input id="txPower" type="number" value="14">
       </div>
 
-      <div class="check-row"><input type="checkbox" id="adr"><span>ADR</span></div>
+      <div class="check-row"><input type="checkbox" id="adr"><span>Adaptive data rate (ADR)</span></div>
       <div class="check-row"><input type="checkbox" id="confirmed"><span>Confirmed uplinks</span></div>
 
       <div>
@@ -772,10 +955,12 @@ input,select{width:100%;padding:11px;border:1px solid #d1d5db;border-radius:7px;
         <input id="customPayload" placeholder="hi and im Dhaanes">
       </div>
 
+      <hr class="sep">
+
       <div>
         <div class="section-title">Health ping interval</div>
         <div class="interval-grid">
-          <div><div class="lbl">Sec</div><input id="intervalSec" type="number" value="0"></div>
+          <div><div class="lbl">Sec</div><input id="intervalSec" type="number" value="2"></div>
           <div><div class="lbl">Min</div><input id="intervalMin" type="number" value="0"></div>
           <div><div class="lbl">Hour</div><input id="intervalHour" type="number" value="0"></div>
           <div><div class="lbl">Day</div><input id="intervalDay" type="number" value="0"></div>
@@ -786,39 +971,67 @@ input,select{width:100%;padding:11px;border:1px solid #d1d5db;border-radius:7px;
         <button class="btn btn-save" onclick="save()">Save</button>
         <button class="btn btn-join" onclick="join()">Join</button>
         <button class="btn btn-leave" onclick="leave()">Leave</button>
-        <button class="btn" onclick="forceUplink()" style="background:#d97706;color:#fff;">Force Uplink</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-force" onclick="forceUplink()">Force uplink</button>
       </div>
     </div>
   </div>
 
-  <!-- DOWNLINK STATE MONITOR (NEW BOX) -->
-  <div class="card">
-    <h2>📡 Downlink State Monitor</h2>
-    <div id="dlStateBox">
-      <div class="dl-row"><span class="dl-label">Uplink:</span><span class="dl-value" id="uplinkState">Not sent yet</span></div>
-      <div class="dl-row"><span class="dl-label">Downlink Window:</span><span class="dl-value" id="dlWindowState">Closed</span></div>
-      <div class="dl-row"><span class="dl-label">Next uplink in:</span><span class="dl-value dl-highlight" id="nextUplinkTimer">--</span></div>
-      <div class="dl-row"><span class="dl-label">Time since uplink:</span><span class="dl-value" id="timeSinceUplink">--</span></div>
-      <div class="dl-row"><span class="dl-label">Downlink status:</span><span class="dl-value" id="dlStatus">Waiting for uplink</span></div>
+  <div style="display:flex;flex-direction:column;gap:16px;">
+    <!-- DOWNLINK STATE MONITOR -->
+    <div class="card">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a8 8 0 0 1 16 0"/><path d="M7 14a4.5 4.5 0 0 1 10 0"/><circle cx="12" cy="17" r="1.4" fill="currentColor" stroke="none"/></svg>Downlink state monitor</h2>
+      <div id="dlStateBox">
+        <div class="dl-row"><span class="dl-label">Uplink</span><span class="dl-value" id="uplinkState">Not sent yet</span></div>
+        <div class="dl-row"><span class="dl-label">Downlink window</span><span class="dl-value" id="dlWindowState">Closed</span></div>
+        <div class="dl-row"><span class="dl-label">Next uplink in</span><span class="dl-value dl-highlight" id="nextUplinkTimer">--</span></div>
+        <div class="dl-row"><span class="dl-label">Time since uplink</span><span class="dl-value" id="timeSinceUplink">--</span></div>
+        <div class="dl-row"><span class="dl-label">Downlink status</span><span class="dl-value" id="dlStatus">Waiting for uplink</span></div>
+      </div>
+    </div>
+
+    <!-- Downlink history -->
+    <div class="card">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>Downlink history</h2>
+      <div id="downlinkBox"><span class="empty">No downlink yet</span></div>
     </div>
   </div>
 
   <!-- Live log -->
-  <div class="card">
-    <h2>Live log</h2>
-    <div id="log">Waiting for events...</div>
-  </div>
-
-  <!-- Downlink history -->
-  <div class="card">
-    <h2>Downlink history</h2>
-    <div id="downlinkBox"><span style="color:#9ca3af;">No downlink yet</span></div>
+  <div class="card span-2">
+    <div class="card-head">
+      <h2><svg class="ic" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h10M4 18h13"/></svg>Live log</h2>
+      <button id="clearLogsBtn" class="btn-clear" onclick="clearLogs()">Clear logs</button>
+    </div>
+    <div id="log">Waiting for events…</div>
   </div>
 
 </div>
 </div>
 
 <script>
+/* ── Theme ── */
+const sunPath='<circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7"/>';
+const moonPath='<path d="M20.5 14.5a8.5 8.5 0 1 1-9-11 7 7 0 0 0 9 11Z"/>';
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  document.getElementById('themeIcon').innerHTML = (t==='dark') ? sunPath : moonPath;
+  try{ localStorage.setItem('rak3112-theme', t); }catch(e){}
+}
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  applyTheme(cur==='dark' ? 'light' : 'dark');
+}
+(function initTheme(){
+  let saved=null;
+  try{ saved = localStorage.getItem('rak3112-theme'); }catch(e){}
+  if(!saved){
+    saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+  }
+  applyTheme(saved);
+})();
+
 function doLogin(){
   if(document.getElementById("pass").value==="2240624"){
     document.getElementById("loginPage").style.display="none";
@@ -841,6 +1054,50 @@ function toggle(){
 }
 document.getElementById("mode").addEventListener("change",toggle);
 
+let deviceInfoLoaded=false;
+async function loadDeviceInfo(){
+  const r=await fetch('/api/deviceinfo');
+  const j=await r.json();
+  document.getElementById('uidName').value=j.uidName||'';
+  document.getElementById('deviceIp').value=j.ip||'';
+  document.getElementById('ledUid').value=j.ledUid||'';
+  document.getElementById('ledMac').value=j.ledMac||'';
+  document.getElementById('ledBoardIp').value=j.ledIp||'';
+  document.getElementById('uidVal').textContent=j.uid||'--';
+  document.getElementById('macVal').textContent=j.mac||'--';
+  document.getElementById('ipVal').textContent=j.ip||'--';
+  document.getElementById('boardDefaultIpVal').textContent=j.boardDefaultIp||'13.22.0.213';
+  document.getElementById('ledUidVal').textContent=j.ledUid||'--';
+  document.getElementById('ledMacVal').textContent=j.ledMac||'--';
+  document.getElementById('ledIpVal').textContent=j.ledIp||'--';
+  document.getElementById('ssidVal').textContent=j.ssid||'--';
+}
+
+async function toggleDeviceInfo(){
+  const panel=document.getElementById('deviceInfoPanel');
+  const btn=document.getElementById('deviceInfoBtn');
+  const willShow=panel.style.display==='none';
+  panel.style.display=willShow?'block':'none';
+  btn.textContent=willShow?'Hide UID / MAC / IP':'Show UID / MAC / IP';
+  if(willShow && !deviceInfoLoaded){
+    await loadDeviceInfo();
+    deviceInfoLoaded=true;
+  }
+}
+
+async function saveDeviceInfo(){
+  const body=JSON.stringify({
+    uidName:document.getElementById('uidName').value.trim(),
+    ip:document.getElementById('deviceIp').value.trim(),
+    ledUid:document.getElementById('ledUid').value.trim(),
+    ledMac:document.getElementById('ledMac').value.trim(),
+    ledIp:document.getElementById('ledBoardIp').value.trim()
+  });
+  await fetch('/api/deviceinfo',{method:'POST',headers:{'Content-Type':'application/json'},body});
+  await loadDeviceInfo();
+  alert('UID/IP updated on board');
+}
+
 async function loadCfg(){
   const r=await fetch('/api/config');const j=await r.json();
   document.getElementById("mode").value=j.mode||"OTAA";
@@ -857,7 +1114,7 @@ async function loadCfg(){
   document.getElementById("fPort").value=j.fPort||1;
   document.getElementById("txPower").value=j.txPower||14;
   document.getElementById("customPayload").value=j.customPayload||"";
-  document.getElementById("intervalSec").value=j.intervalSec||0;
+  document.getElementById("intervalSec").value=j.intervalSec||2;
   document.getElementById("intervalMin").value=j.intervalMin||0;
   document.getElementById("intervalHour").value=j.intervalHour||0;
   document.getElementById("intervalDay").value=j.intervalDay||0;
@@ -880,12 +1137,32 @@ async function save(){
     fPort:parseInt(document.getElementById("fPort").value)||1,
     txPower:parseInt(document.getElementById("txPower").value)||14,
     customPayload:document.getElementById("customPayload").value,
-    intervalSec:parseInt(document.getElementById("intervalSec").value)||0,
+    intervalSec:parseInt(document.getElementById("intervalSec").value)||2,
     intervalMin:parseInt(document.getElementById("intervalMin").value)||0,
     intervalHour:parseInt(document.getElementById("intervalHour").value)||0,
     intervalDay:parseInt(document.getElementById("intervalDay").value)||0
   });
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body});
+}
+
+async function clearLogs(){
+  const btn=document.getElementById('clearLogsBtn');
+  const box=document.getElementById('log');
+  if(!btn)return;
+  if(btn.disabled)return;
+
+  btn.disabled=true;
+  btn.classList.add('is-busy');
+  btn.textContent='Clearing…';
+  box.innerHTML='Waiting for events…';
+
+  try{
+    await fetch('/api/logs/clear',{method:'POST'});
+  }catch(e){}
+
+  btn.disabled=false;
+  btn.classList.remove('is-busy');
+  btn.textContent='Clear logs';
 }
 
 async function join(){await fetch('/api/join',{method:'POST'});}
@@ -911,13 +1188,13 @@ function startPolling(){
       const state=await rState.json();
       
       if(state.uplinkSent){
-        document.getElementById("uplinkState").innerHTML=`✓ Sent (${state.uplinkPayloadSize}B, port ${state.uplinkFPort})<br><small>${new Date(state.uplinkTimestamp).toLocaleTimeString()}</small>`;
-        document.getElementById("dlWindowState").innerHTML='<span style="color:#059669;">✓ OPEN - TTN can schedule downlink</span>';
+        document.getElementById("uplinkState").innerHTML=`✓ Sent (${state.uplinkPayloadSize}B, port ${state.uplinkFPort})`;
+        document.getElementById("dlWindowState").innerHTML='<span style="color:var(--success);">✓ Open — TTN can schedule downlink</span>';
         if(state.downlinkReceived){
           const info=state.hasAppPayload?`Received ${state.downlinkPayloadSize}B on port ${state.downlinkFPort}`:'MAC command only';
           document.getElementById("dlStatus").innerHTML=info;
         }else{
-          document.getElementById("dlStatus").innerHTML='<span style="color:#d97706;">Waiting for TTN scheduling...</span>';
+          document.getElementById("dlStatus").innerHTML='<span class="dl-warning">Waiting for TTN scheduling…</span>';
         }
       }
       
@@ -927,30 +1204,32 @@ function startPolling(){
       const rLog=await fetch('/api/logs');
       const jLog=await rLog.json();
       const box=document.getElementById("log");
-      box.innerHTML="";
-      for(const e of jLog.logs){
-        const line=`[${e.t}][${e.d}] ${e.m}`;
-        const span=document.createElement('div');
-        if(e.d==='UP')span.className='log-up';
-        else if(e.d==='DOWN')span.className='log-down';
-        else if(e.d==='ERROR')span.className='log-err';
-        span.textContent=line;
-        box.appendChild(span);
+      const clearBtn=document.getElementById("clearLogsBtn");
+      if(!(clearBtn&&clearBtn.disabled)){
+        box.innerHTML="";
+        for(const e of jLog.logs){
+          const line=`[${e.t}][${e.d}] ${e.m}`;
+          const span=document.createElement('div');
+          if(e.d==='UP')span.className='log-up';
+          else if(e.d==='DOWN')span.className='log-down';
+          else if(e.d==='ERROR')span.className='log-err';
+          span.textContent=line;
+          box.appendChild(span);
+        }
+        box.scrollTop=box.scrollHeight;
       }
-      box.scrollTop=box.scrollHeight;
       
       const rDl=await fetch('/api/downlink');
       const jDl=await rDl.json();
       const dlBox=document.getElementById("downlinkBox");
       if(!jDl.downlink||jDl.downlink.length===0){
-        dlBox.innerHTML='<span style="color:#9ca3af;">No downlink yet</span>';
+        dlBox.innerHTML='<span class="empty">No downlink yet</span>';
       }else{
         dlBox.innerHTML="";
         for(const e of [...jDl.downlink].reverse()){
           const row=document.createElement("div");
-          row.style.padding='4px 0';
-          row.style.borderBottom='1px solid #e0e4ec';
-          row.innerHTML=`<span style="color:#9ca3af;">${e.t}</span> <span class="dl-port">port ${e.fport}</span> <span style="color:#4f6ef7;">${e.hex||'(empty)'}</span> <span style="color:#6b7280;">${e.ascii||''}</span>`;
+          row.className='dl-entry';
+          row.innerHTML=`<span class="dl-time">${e.t}</span><span class="dl-port">PORT ${e.fport}</span><span class="dl-hex">${e.hex||'(empty)'}</span><span class="dl-ascii">${e.ascii||''}</span>`;
           dlBox.appendChild(row);
         }
       }
@@ -958,12 +1237,16 @@ function startPolling(){
       if(jLog.joined){
         document.getElementById("statusPill").className="status-pill pill-ok";
         document.getElementById("statusTxt").textContent="Joined";
+      }else{
+        document.getElementById("statusPill").className="status-pill pill-idle";
+        document.getElementById("statusTxt").textContent="Not connected";
       }
     }catch(e){}
   },1000);
 }
 </script>
 </body></html>
+
 )HTML";
 
 void handleRoot() {
@@ -971,7 +1254,7 @@ void handleRoot() {
 }
 
 void handleGetConfig() {
-  DynamicJsonDocument doc(2048);
+  JsonDocument doc;
   doc["mode"] = cfg.mode;
   doc["region"] = cfg.region;
   doc["frequencyHz"] = cfg.frequencyHz;
@@ -995,9 +1278,108 @@ void handleGetConfig() {
   doc["intervalHour"] = cfg.intervalHour;
   doc["intervalDay"] = cfg.intervalDay;
   doc["intervalMonth"] = cfg.intervalMonth;
+  doc["uidName"] = cfg.uidName;
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
+}
+
+void handleGetDeviceInfo() {
+  JsonDocument doc;
+  uint64_t efuse = ESP.getEfuseMac();
+  char uidHex[17];
+  snprintf(uidHex, sizeof(uidHex), "%08lX%08lX", (uint32_t)(efuse >> 32), (uint32_t)efuse);
+
+  doc["uid"] = uidHex;
+  doc["uidName"] = cfg.uidName;
+  doc["mac"] = WiFi.softAPmacAddress();
+  doc["ip"] = g_apIp.toString();
+  doc["boardDefaultIp"] = BOARD_IP_DEFAULT_INFO;
+  doc["ledUid"] = cfg.ledUid;
+  doc["ledMac"] = cfg.ledMac;
+  doc["ledIp"] = cfg.ledIp;
+  doc["ssid"] = g_apSsid;
+  doc["joined"] = g_lwActivated;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handlePostDeviceInfo() {
+  if (!server.hasArg("plain")) {
+    server.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) {
+    server.send(400, "application/json", "{\"error\":\"bad json\"}");
+    return;
+  }
+
+  String newName = String((const char*)(doc["uidName"] | ""));
+  newName.trim();
+  if (newName.length() == 0) {
+    newName = AP_SSID_DEFAULT;
+  }
+  if (newName.length() >= (int)sizeof(cfg.uidName)) {
+    newName = newName.substring(0, sizeof(cfg.uidName) - 1);
+  }
+
+  String newIp = String((const char*)(doc["ip"] | ""));
+  newIp.trim();
+  if (newIp.length() == 0) {
+    newIp = String(cfg.apIp);
+  }
+
+  String newLedUid = String((const char*)(doc["ledUid"] | ""));
+  newLedUid.trim();
+  if (newLedUid.length() == 0) {
+    newLedUid = "08-44";
+  }
+  if (newLedUid.length() >= (int)sizeof(cfg.ledUid)) {
+    newLedUid = newLedUid.substring(0, sizeof(cfg.ledUid) - 1);
+  }
+
+  String newLedMac = String((const char*)(doc["ledMac"] | ""));
+  newLedMac.trim();
+  if (newLedMac.length() == 0) {
+    newLedMac = "DE:AD:BE:EF:FE:ED";
+  }
+  if (newLedMac.length() >= (int)sizeof(cfg.ledMac)) {
+    newLedMac = newLedMac.substring(0, sizeof(cfg.ledMac) - 1);
+  }
+
+  String newLedIp = String((const char*)(doc["ledIp"] | ""));
+  newLedIp.trim();
+  if (newLedIp.length() == 0) {
+    newLedIp = BOARD_IP_DEFAULT_INFO;
+  }
+  if (newLedIp.length() >= (int)sizeof(cfg.ledIp)) {
+    newLedIp = newLedIp.substring(0, sizeof(cfg.ledIp) - 1);
+  }
+  IPAddress parsedIp;
+  if (!parsedIp.fromString(newIp)) {
+    server.send(400, "application/json", "{\"error\":\"invalid ip\"}");
+    return;
+  }
+
+  strlcpy(cfg.uidName, newName.c_str(), sizeof(cfg.uidName));
+  strlcpy(cfg.apIp, newIp.c_str(), sizeof(cfg.apIp));
+  strlcpy(cfg.ledUid, newLedUid.c_str(), sizeof(cfg.ledUid));
+  strlcpy(cfg.ledMac, newLedMac.c_str(), sizeof(cfg.ledMac));
+  strlcpy(cfg.ledIp, newLedIp.c_str(), sizeof(cfg.ledIp));
+  strlcpy(g_apSsid, cfg.uidName, sizeof(g_apSsid));
+  syncApIpFromConfig();
+  saveConfig();
+
+  WiFi.softAPdisconnect(true);
+  delay(120);
+  WiFi.softAPConfig(g_apIp, g_apGw, AP_SN);
+  bool apOk = WiFi.softAP(g_apSsid, AP_PASSWORD);
+  addLog(apOk ? "INFO" : "ERROR", String("UID/AP updated: ") + g_apSsid + " @ " + g_apIp.toString());
+
+  server.send(200, "application/json", apOk ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 void handlePostConfig() {
@@ -1005,7 +1387,7 @@ void handlePostConfig() {
     server.send(400, "application/json", "{\"error\":\"no body\"}");
     return;
   }
-  DynamicJsonDocument doc(4096);
+  JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) {
     server.send(400, "application/json", "{\"error\":\"bad json\"}");
     return;
@@ -1028,7 +1410,7 @@ void handlePostConfig() {
   strlcpy(cfg.appSKey, doc["appSKey"] | "", sizeof(cfg.appSKey));
   strlcpy(cfg.lwClass, "C", sizeof(cfg.lwClass));
   strlcpy(cfg.customPayload, doc["customPayload"] | "", sizeof(cfg.customPayload));
-  cfg.intervalSec = doc["intervalSec"] | 0;
+  cfg.intervalSec = doc["intervalSec"] | 2;
   cfg.intervalMin = doc["intervalMin"] | 0;
   cfg.intervalHour = doc["intervalHour"] | 0;
   cfg.intervalDay = doc["intervalDay"] | 0;
@@ -1045,13 +1427,13 @@ void handlePostConfig() {
 
 void handleGetLogs() {
   const int kMaxLines = 120;
-  DynamicJsonDocument doc(24576);
-  JsonArray arr = doc.createNestedArray("logs");
+  JsonDocument doc;
+  JsonArray arr = doc["logs"].to<JsonArray>();
   int n = logCount < kMaxLines ? logCount : kMaxLines;
   int start = logCount >= MAX_LOG ? (logHead - n + MAX_LOG) % MAX_LOG : 0;
   for (int i = 0; i < n; i++) {
     int idx = (start + i) % MAX_LOG;
-    JsonObject o = arr.createNestedObject();
+    JsonObject o = arr.add<JsonObject>();
     o["t"] = logs[idx].t;
     o["d"] = logs[idx].dir;
     String m = logs[idx].msg;
@@ -1066,14 +1448,20 @@ void handleGetLogs() {
   server.send(200, "application/json", out);
 }
 
+void handleClearLogs() {
+  logHead = 0;
+  logCount = 0;
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 void handleGetDownlink() {
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.createNestedArray("downlink");
+  JsonDocument doc;
+  JsonArray arr = doc["downlink"].to<JsonArray>();
   int n = downlinkCount < MAX_DOWNLINK ? downlinkCount : MAX_DOWNLINK;
   int start = downlinkCount >= MAX_DOWNLINK ? (downlinkHead - n + MAX_DOWNLINK) % MAX_DOWNLINK : 0;
   for (int i = 0; i < n; i++) {
     int idx = (start + i) % MAX_DOWNLINK;
-    JsonObject o = arr.createNestedObject();
+    JsonObject o = arr.add<JsonObject>();
     o["t"] = downlinks[idx].t;
     o["hex"] = downlinks[idx].hex;
     o["ascii"] = downlinks[idx].ascii;
@@ -1086,7 +1474,7 @@ void handleGetDownlink() {
 }
 
 void handleGetDlState() {
-  DynamicJsonDocument doc(1024);
+  JsonDocument doc;
   doc["uplinkSent"] = dlTracker.uplinkSent;
   doc["uplinkTimestamp"] = dlTracker.uplinkTimestamp;
   doc["uplinkPayloadSize"] = dlTracker.uplinkPayloadSize;
@@ -1164,9 +1552,11 @@ void handleForceUplink() {
       addDownlink(t, hx.c_str(), asc.c_str(), (int)downLen, rxFPort);
       
       Serial.println(asc);
-      if (ENABLE_PICO_UART) picoUart.println(asc);
-      Serial.print("[PICO] Sent via UART1 (force): ");
-      Serial.println(asc);
+      picoUartWriteLine(asc.c_str());
+      if (PICO_UART_BRIDGE_ENABLED) {
+        picoUart.print("[PICO] Sent via UART1 (force): ");
+        picoUart.println(asc);
+      }
       
       dlTracker.downlinkReceived = true;
       dlTracker.downlinkTimestamp = ms;
@@ -1194,15 +1584,39 @@ void handleForceUplink() {
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
+void handleSerialCommands() {
+  static String line;
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      line.trim();
+      if (line.length() > 0 && line.equalsIgnoreCase("getuid")) {
+        Serial.println("[LED-BOARD] UID=" + String(cfg.ledUid));
+        Serial.println("[LED-BOARD] MAC=" + String(cfg.ledMac));
+        Serial.println("[LED-BOARD] IP=" + String(cfg.ledIp));
+        addLog("INFO", "YAT getuid requested LED board identity.");
+      }
+      line = "";
+    } else if (c >= 32 && c <= 126) {
+      if (line.length() < 96) {
+        line += c;
+      }
+    }
+  }
+}
+
 // ─── setup / loop ────────────────────────────────────────────────────────────
 void setup() {
-  // Safe boot: start serial first and use defaults to avoid early boot loops.
-  Serial.begin(115200);
-  loadConfigDefaults();
-  Serial.println("[BOOT] Safe defaults loaded");
-  // --- ADDED FOR PICO FORWARDING: initialise UART0 (pins J6-7/8) at 115200 ---
-  if (ENABLE_PICO_UART) {
+  loadConfig();
+  strlcpy(g_apSsid, cfg.uidName[0] ? cfg.uidName : AP_SSID_DEFAULT, sizeof(g_apSsid));
+  Serial.begin(cfg.serialBaud);
+  // Initialize UART1 bridge to Pico.
+  if (PICO_UART_BRIDGE_ENABLED) {
     picoUart.begin(115200, SERIAL_8N1, PICO_UART_RX_PIN, PICO_UART_TX_PIN);
+    addLog("INFO", String("Pico UART bridge enabled TX=") + PICO_UART_TX_PIN + " RX=" + PICO_UART_RX_PIN);
+  } else {
+    addLog("WARN", "Pico UART bridge disabled (safe boot mode)");
   }
   delay(300);
 
@@ -1221,18 +1635,9 @@ void setup() {
   addLog("INIT", String("Serial baud=") + cfg.serialBaud);
 
   WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
-  bool apStarted = false;
-  if (AP_PASSWORD && strlen(AP_PASSWORD) >= 8) {
-    apStarted = WiFi.softAP(AP_SSID, AP_PASSWORD);
-  } else {
-    // Start open AP when password is blank/short to avoid startup failure.
-    apStarted = WiFi.softAP(AP_SSID);
-    addLog("WARN", "AP password empty/short: starting open AP");
-  }
-
-  if (apStarted) {
-    addLog("INIT", String("AP ") + AP_SSID + " → http://192.168.4.1");
+  WiFi.softAPConfig(g_apIp, g_apGw, AP_SN);
+  if (WiFi.softAP(g_apSsid, AP_PASSWORD)) {
+    addLog("INIT", String("AP ") + g_apSsid + " → http://" + g_apIp.toString());
   } else {
     addLog("ERROR", "AP start failed");
   }
@@ -1240,7 +1645,10 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/config", HTTP_GET, handleGetConfig);
   server.on("/api/config", HTTP_POST, handlePostConfig);
+  server.on("/api/deviceinfo", HTTP_GET, handleGetDeviceInfo);
+  server.on("/api/deviceinfo", HTTP_POST, handlePostDeviceInfo);
   server.on("/api/logs", HTTP_GET, handleGetLogs);
+  server.on("/api/logs/clear", HTTP_POST, handleClearLogs);
   server.on("/api/downlink", HTTP_GET, handleGetDownlink);
   server.on("/api/dlstate", HTTP_GET, handleGetDlState);
   server.on("/api/join", HTTP_POST, handleJoinReq);
@@ -1249,7 +1657,13 @@ void setup() {
   server.begin();
 
   addLog("INFO", "Load TTN keys, Save, then Join.");
-  addLog("INFO", "Auto-join on boot disabled (safe boot mode).");
+    // Auto-join on boot if configuration is valid
+  if (isConfigValid()) {
+    addLog("INFO", "Valid configuration found, auto-joining...");
+    doJoin();
+  } else {
+    addLog("WARN", "Incomplete configuration. Please enter keys and save, then join manually.");
+  }
 }
 
 // ─── Periodic uplink + FIXED downlink reception ───────────────────────────────
@@ -1288,7 +1702,7 @@ void doPeriodicUplink() {
     dlTracker.downlinkReceived = false;
   } else if (st > 0 && downLen > 0) {
     // ========== DOWNLINK RECEIVED - BLINK GREEN LED ==========
-    Serial.println(">>> DOWNLINK PAYLOAD RECEIVED - BLINKING GREEN LED <<<");
+    picoUart.println(">>> DOWNLINK PAYLOAD RECEIVED - BLINKING GREEN LED <<<");
     
     // BLINK GREEN LED
     for (int blink = 0; blink < 7; blink++) {
@@ -1314,9 +1728,11 @@ void doPeriodicUplink() {
     addDownlink(t, hx.c_str(), asc.c_str(), (int)downLen, rxFPort);
     
     if (downLen > 0) {
-      if (ENABLE_PICO_UART) picoUart.println(asc);
-      Serial.print("[PICO] Sent via UART1 (downlink): ");
-      Serial.println(asc);
+      picoUartWriteLine(asc.c_str());
+      if (PICO_UART_BRIDGE_ENABLED) {
+        picoUart.print("[PICO] Sent via UART1 (downlink): ");
+        picoUart.println(asc);
+      }
     }
     
     dlTracker.downlinkReceived = true;
@@ -1386,9 +1802,11 @@ void checkClassCDownlink() {
     
     // UART Output - Class C Downlink
     Serial.println(asc);
-    if (ENABLE_PICO_UART) picoUart.println(asc);
-    Serial.print("[PICO] Sent via UART1 (Class C): ");
-    Serial.println(asc);
+    picoUartWriteLine(asc.c_str());
+    if (PICO_UART_BRIDGE_ENABLED) {
+      picoUart.print("[PICO] Sent via UART1 (Class C): ");
+      picoUart.println(asc);
+    }
     
     dlTracker.downlinkReceived = true;
     dlTracker.downlinkTimestamp = ms;
@@ -1406,6 +1824,7 @@ void checkClassCDownlink() {
 
 void loop() {
   server.handleClient();
+  handleSerialCommands();
   doPeriodicUplink();
   checkClassCDownlink();
   verifyClassC();
